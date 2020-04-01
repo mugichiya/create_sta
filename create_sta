@@ -1,0 +1,1121 @@
+#!/bin/bash
+
+# general dependencies:
+#    bash (to run this script)
+#    util-linux (for getopt)
+#    procps or procps-ng
+#    hostapd
+#    iproute2
+#    iw
+#    iwconfig (you only need this if 'iw' can not recognize your adapter)
+#    haveged (optional)
+
+# dependencies for 'nat' or 'none' Internet sharing method
+#    dnsmasq
+#    iptables
+
+VERSION=0.0.2
+PROGNAME="$(basename $0)"
+
+# make sure that all command outputs are in english
+# so we can parse them correctly
+export LC_ALL=C
+
+# all new files and directories must be readable only by root.
+# in special cases we must use chmod to give any other permissions.
+SCRIPT_UMASK=0077
+umask $SCRIPT_UMASK
+
+usage() {
+    echo "Usage: "$PROGNAME" [options] -- <wifi-interface> [<access-point-name> [<passphrase>]]"
+    echo
+    echo "Options:"
+    echo "  -h, --help              Show this help"
+    echo "  -v, --version           Print version number"
+    echo "  -d, --driver <driver>   Choose your WiFi adapter driver (default: nl80211)"
+    echo "  -w, --wpa <WPA version> Use 1 for WPA, use 2 for WPA2, use 1+2 for both (default: 1+2)"
+    echo "  -p, --pair  <ENC>       Use CCMP, TKIP, or CCMP+TKIP (default: CCMP) "
+    echo "  -g, --group <ENC>       Use CCMP, TKIP, or CCMP+TKIP (default: CCMP) "
+    echo "  --psk                   Use 64 hex digits pre-shared-key instead of passphrase"    
+    echo "  --wep                   Use 10 or 26 hex digits WEP key instead of WPA series"
+    echo "  --mac <MAC>             Set MAC address"
+    echo "  --hidden                Try to connect the hidden Access Point"
+    echo "  --dhcp                  Use DHCP to obtain an IP address "
+    echo "  --daemon                Run create_sta in the background"
+    echo "  --pidfile <pidfile>     Save daemon PID to file"
+    echo "  --logfile <logfile>     Save daemon messages to file"
+    echo "  --config <conf_file>    Load configs from conf_file"
+    echo "  --stop <id>             Send stop command to an already running create_sta. For an <id>"
+    echo "                          you can put the PID of create_sta or the WiFi interface. You can"
+    echo "                          get them with --list-running"
+    echo "  --list-running          Show the create_sta processes that are already running"
+    echo "  --list-clients <id>     List the clients connected to create_sta instance associated with <id>."
+    echo "                          For an <id> you can put the PID of create_sta or the WiFi interface."
+    echo
+    echo "Examples:"
+    echo "  "$PROGNAME" wlan0 MyAccessPoint"
+    echo "  "$PROGNAME" --wep wlan0 MyAccessPoint MyPassPhrase"
+    echo "  "$PROGNAME" --wpa 2 --pair CCMP --group CCMP wlan0 MyAccessPoint MyPassPhrase"
+    echo "  "$PROGNAME" --wpa 1 --pair TKIP --group TKIP wlan0 MyAccessPoint MyPassPhrase"
+    echo "  "$PROGNAME" wlan0 MyAccessPoint MyPassPhrase --daemon --dhcp"
+    echo "  "$PROGNAME" wlan0 --config /path/to/wpa_supplicant.conf --daemon --dhcp"
+    echo "  "$PROGNAME" --stop wlan0"
+}
+
+
+# on success it echos a non-zero unused FD
+# on error it echos 0
+get_avail_fd() {
+    local x
+    for x in $(seq 1 $(ulimit -n)); do
+        if [[ ! -a "/proc/$BASHPID/fd/$x" ]]; then
+            echo $x
+            return
+        fi
+    done
+    echo 0
+}
+
+# lock file for the mutex counter
+COUNTER_LOCK_FILE=/tmp/create_sta.$$.lock
+
+cleanup_lock() {
+    rm -f $COUNTER_LOCK_FILE
+}
+
+init_lock() {
+    local LOCK_FILE=/tmp/create_sta.all.lock
+
+    # we initialize only once
+    [[ $LOCK_FD -ne 0 ]] && return 0
+
+    LOCK_FD=$(get_avail_fd)
+    [[ $LOCK_FD -eq 0 ]] && return 1
+
+    # open/create lock file with write access for all users
+    # otherwise normal users will not be able to use it.
+    # to avoid race conditions on creation, we need to
+    # use umask to set the permissions.
+    umask 0555
+    eval "exec $LOCK_FD>$LOCK_FILE" > /dev/null 2>&1 || return 1
+    umask $SCRIPT_UMASK
+
+    # there is a case where lock file was created from a normal
+    # user. change the owner to root as soon as we can.
+    [[ $(id -u) -eq 0 ]] && chown 0:0 $LOCK_FILE
+
+    # create mutex counter lock file
+    echo 0 > $COUNTER_LOCK_FILE
+
+    return $?
+}
+
+# recursive mutex lock for all create_sta processes
+mutex_lock() {
+    local counter_mutex_fd
+    local counter
+
+    # lock local mutex and read counter
+    counter_mutex_fd=$(get_avail_fd)
+    if [[ $counter_mutex_fd -ne 0 ]]; then
+        eval "exec $counter_mutex_fd<>$COUNTER_LOCK_FILE"
+        flock $counter_mutex_fd
+        read -u $counter_mutex_fd counter
+    else
+        echo "Failed to lock mutex counter" >&2
+        return 1
+    fi
+
+    # lock global mutex and increase counter
+    [[ $counter -eq 0 ]] && flock $LOCK_FD
+    counter=$(( $counter + 1 ))
+
+    # write counter and unlock local mutex
+    echo $counter > /proc/$BASHPID/fd/$counter_mutex_fd
+    eval "exec ${counter_mutex_fd}<&-"
+    return 0
+}
+
+# recursive mutex unlock for all create_sta processes
+mutex_unlock() {
+    local counter_mutex_fd
+    local counter
+
+    # lock local mutex and read counter
+    counter_mutex_fd=$(get_avail_fd)
+    if [[ $counter_mutex_fd -ne 0 ]]; then
+        eval "exec $counter_mutex_fd<>$COUNTER_LOCK_FILE"
+        flock $counter_mutex_fd
+        read -u $counter_mutex_fd counter
+    else
+        echo "Failed to lock mutex counter" >&2
+        return 1
+    fi
+
+    # decrease counter and unlock global mutex
+    if [[ $counter -gt 0 ]]; then
+        counter=$(( $counter - 1 ))
+        [[ $counter -eq 0 ]] && flock -u $LOCK_FD
+    fi
+
+    # write counter and unlock local mutex
+    echo $counter > /proc/$BASHPID/fd/$counter_mutex_fd
+    eval "exec ${counter_mutex_fd}<&-"
+    return 0
+}
+
+# it takes 2 arguments
+# returns:
+#  0 if v1 (1st argument) and v2 (2nd argument) are the same
+#  1 if v1 is less than v2
+#  2 if v1 is greater than v2
+version_cmp() {
+    local V1 V2 VN x
+    [[ ! $1 =~ ^[0-9]+(\.[0-9]+)*$ ]] && die "Wrong version format!"
+    [[ ! $2 =~ ^[0-9]+(\.[0-9]+)*$ ]] && die "Wrong version format!"
+
+    V1=( $(echo $1 | tr '.' ' ') )
+    V2=( $(echo $2 | tr '.' ' ') )
+    VN=${#V1[@]}
+    [[ $VN -lt ${#V2[@]} ]] && VN=${#V2[@]}
+
+    for ((x = 0; x < $VN; x++)); do
+        [[ ${V1[x]} -lt ${V2[x]} ]] && return 1
+        [[ ${V1[x]} -gt ${V2[x]} ]] && return 2
+    done
+
+    return 0
+}
+
+USE_IWCONFIG=0
+
+is_interface() {
+    [[ -z "$1" ]] && return 1
+    [[ -d "/sys/class/net/${1}" ]]
+}
+
+is_wifi_interface() {
+    which iw > /dev/null 2>&1 && iw dev $1 info > /dev/null 2>&1 && return 0
+    if which iwconfig > /dev/null 2>&1 && iwconfig $1 > /dev/null 2>&1; then
+        USE_IWCONFIG=1
+        return 0
+    fi
+    return 1
+}
+
+get_phy_device() {
+    local x
+    for x in /sys/class/ieee80211/*; do
+        [[ ! -e "$x" ]] && continue
+        if [[ "${x##*/}" = "$1" ]]; then
+            echo $1
+            return 0
+        elif [[ -e "$x/device/net/$1" ]]; then
+            echo ${x##*/}
+            return 0
+        elif [[ -e "$x/device/net:$1" ]]; then
+            echo ${x##*/}
+            return 0
+        fi
+    done
+    echo "Failed to get phy interface" >&2
+    return 1
+}
+
+get_adapter_info() {
+    local PHY
+    PHY=$(get_phy_device "$1")
+    [[ $? -ne 0 ]] && return 1
+    iw phy $PHY info
+}
+
+get_adapter_kernel_module() {
+    local MODULE
+    MODULE=$(readlink -f "/sys/class/net/$1/device/driver/module")
+    echo ${MODULE##*/}
+}
+
+can_be_sta_and_ap() {
+    # iwconfig does not provide this information, assume false
+    [[ $USE_IWCONFIG -eq 1 ]] && return 1
+    if [[ "$(get_adapter_kernel_module "$1")" == "brcmfmac" ]]; then
+        echo "WARN: brmfmac driver doesn't work properly with virtual interfaces and" >&2
+        echo "      it can cause kernel panic. For this reason we disallow virtual" >&2
+        echo "      interfaces for your adapter." >&2
+        echo "      For more info: https://github.com/verifsec/create_sta/issues/203" >&2
+        return 1
+    fi
+    get_adapter_info "$1" | grep -E '{.* managed.* AP.*}' > /dev/null 2>&1 && return 0
+    get_adapter_info "$1" | grep -E '{.* AP.* managed.*}' > /dev/null 2>&1 && return 0
+    return 1
+}
+
+can_be_ap() {
+    # iwconfig does not provide this information, assume true
+    [[ $USE_IWCONFIG -eq 1 ]] && return 0
+    get_adapter_info "$1" | grep -E '\* AP$' > /dev/null 2>&1 && return 0
+    return 1
+}
+
+
+
+is_wifi_connected() {
+    if [[ $USE_IWCONFIG -eq 0 ]]; then
+        iw dev "$1" link 2>&1 | grep -E '^Connected to' > /dev/null 2>&1 && return 0
+    else
+        iwconfig "$1" 2>&1 | grep -E 'Access Point: [0-9a-fA-F]{2}:' > /dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+is_macaddr() {
+    echo "$1" | grep -E "^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$" > /dev/null 2>&1
+}
+
+is_unicast_macaddr() {
+    local x
+    is_macaddr "$1" || return 1
+    x=$(echo "$1" | cut -d: -f1)
+    x=$(printf '%d' "0x${x}")
+    [[ $(expr $x % 2) -eq 0 ]]
+}
+
+get_macaddr() {
+    is_interface "$1" || return
+    cat "/sys/class/net/${1}/address"
+}
+
+alloc_new_iface() {
+    local prefix=$1
+    local i=0
+
+    mutex_lock
+    while :; do
+        if ! is_interface $prefix$i && [[ ! -f $COMMON_CONFDIR/ifaces/$prefix$i ]]; then
+            mkdir -p $COMMON_CONFDIR/ifaces
+            touch $COMMON_CONFDIR/ifaces/$prefix$i
+            echo $prefix$i
+            mutex_unlock
+            return
+        fi
+        i=$((i + 1))
+    done
+    mutex_unlock
+}
+
+dealloc_iface() {
+    rm -f $COMMON_CONFDIR/ifaces/$1
+}
+
+get_all_macaddrs() {
+    cat /sys/class/net/*/address
+}
+
+get_new_macaddr() {
+    local OLDMAC NEWMAC LAST_BYTE i
+    OLDMAC=$(get_macaddr "$1")
+    LAST_BYTE=$(printf %d 0x${OLDMAC##*:})
+    mutex_lock
+    for i in {1..255}; do
+        NEWMAC="${OLDMAC%:*}:$(printf %02x $(( ($LAST_BYTE + $i) % 256 )))"
+        (get_all_macaddrs | grep "$NEWMAC" > /dev/null 2>&1) || break
+    done
+    mutex_unlock
+    echo $NEWMAC
+}
+
+# start haveged when needed
+haveged_watchdog() {
+    local show_warn=1
+    while :; do
+        mutex_lock
+        if [[ $(cat /proc/sys/kernel/random/entropy_avail) -lt 1000 ]]; then
+            if ! which haveged > /dev/null 2>&1; then
+                if [[ $show_warn -eq 1 ]]; then
+                    echo "WARN: Low entropy detected. We recommend you to install \`haveged'"
+                    show_warn=0
+                fi
+            elif ! pidof haveged > /dev/null 2>&1; then
+                echo "Low entropy detected, starting haveged"
+                # boost low-entropy
+                haveged -w 1024 -p $COMMON_CONFDIR/haveged.pid
+            fi
+        fi
+        mutex_unlock
+        sleep 2
+    done
+}
+
+NETWORKMANAGER_CONF=/etc/NetworkManager/NetworkManager.conf
+NM_OLDER_VERSION=1
+
+networkmanager_exists() {
+    local NM_VER
+    which nmcli > /dev/null 2>&1 || return 1
+    NM_VER=$(nmcli -v | grep -m1 -oE '[0-9]+(\.[0-9]+)*\.[0-9]+')
+    version_cmp $NM_VER 0.9.9
+    if [[ $? -eq 1 ]]; then
+        NM_OLDER_VERSION=1
+    else
+        NM_OLDER_VERSION=0
+    fi
+    return 0
+}
+
+networkmanager_is_running() {
+    local NMCLI_OUT
+    networkmanager_exists || return 1
+    if [[ $NM_OLDER_VERSION -eq 1 ]]; then
+        NMCLI_OUT=$(nmcli -t -f RUNNING nm 2>&1 | grep -E '^running$')
+    else
+        NMCLI_OUT=$(nmcli -t -f RUNNING g 2>&1 | grep -E '^running$')
+    fi
+    [[ -n "$NMCLI_OUT" ]]
+}
+
+networkmanager_iface_is_unmanaged() {
+    is_interface "$1" || return 2
+    (nmcli -t -f DEVICE,STATE d 2>&1 | grep -E "^$1:unmanaged$" > /dev/null 2>&1) || return 1
+}
+
+ADDED_UNMANAGED=
+
+networkmanager_add_unmanaged() {
+    local MAC UNMANAGED WAS_EMPTY x
+    networkmanager_exists || return 1
+
+    [[ -d ${NETWORKMANAGER_CONF%/*} ]] || mkdir -p ${NETWORKMANAGER_CONF%/*}
+    [[ -f ${NETWORKMANAGER_CONF} ]] || touch ${NETWORKMANAGER_CONF}
+
+    if [[ $NM_OLDER_VERSION -eq 1 ]]; then
+        if [[ -z "$2" ]]; then
+            MAC=$(get_macaddr "$1")
+        else
+            MAC="$2"
+        fi
+        [[ -z "$MAC" ]] && return 1
+    fi
+
+    mutex_lock
+    UNMANAGED=$(grep -m1 -Eo '^unmanaged-devices=[[:alnum:]:;,-]*' /etc/NetworkManager/NetworkManager.conf)
+
+    WAS_EMPTY=0
+    [[ -z "$UNMANAGED" ]] && WAS_EMPTY=1
+    UNMANAGED=$(echo "$UNMANAGED" | sed 's/unmanaged-devices=//' | tr ';,' ' ')
+
+    # if it exists, do nothing
+    for x in $UNMANAGED; do
+        if [[ $x == "mac:${MAC}" ]] ||
+               [[ $NM_OLDER_VERSION -eq 0 && $x == "interface-name:${1}" ]]; then
+            mutex_unlock
+            return 2
+        fi
+    done
+
+    if [[ $NM_OLDER_VERSION -eq 1 ]]; then
+        UNMANAGED="${UNMANAGED} mac:${MAC}"
+    else
+        UNMANAGED="${UNMANAGED} interface-name:${1}"
+    fi
+
+    UNMANAGED=$(echo $UNMANAGED | sed -e 's/^ //')
+    UNMANAGED="${UNMANAGED// /;}"
+    UNMANAGED="unmanaged-devices=${UNMANAGED}"
+
+    if ! grep -E '^\[keyfile\]' ${NETWORKMANAGER_CONF} > /dev/null 2>&1; then
+        echo -e "\n\n[keyfile]\n${UNMANAGED}" >> ${NETWORKMANAGER_CONF}
+    elif [[ $WAS_EMPTY -eq 1 ]]; then
+        sed -e "s/^\(\[keyfile\].*\)$/\1\n${UNMANAGED}/" -i ${NETWORKMANAGER_CONF}
+    else
+        sed -e "s/^unmanaged-devices=.*/${UNMANAGED}/" -i ${NETWORKMANAGER_CONF}
+    fi
+
+    ADDED_UNMANAGED="${ADDED_UNMANAGED} ${1} "
+    mutex_unlock
+
+    local nm_pid=$(pidof NetworkManager)
+    [[ -n "$nm_pid" ]] && kill -HUP $nm_pid
+
+    return 0
+}
+
+networkmanager_rm_unmanaged() {
+    local MAC UNMANAGED
+    networkmanager_exists || return 1
+    [[ ! -f ${NETWORKMANAGER_CONF} ]] && return 1
+
+    if [[ $NM_OLDER_VERSION -eq 1 ]]; then
+        if [[ -z "$2" ]]; then
+            MAC=$(get_macaddr "$1")
+        else
+            MAC="$2"
+        fi
+        [[ -z "$MAC" ]] && return 1
+    fi
+
+    mutex_lock
+    UNMANAGED=$(grep -m1 -Eo '^unmanaged-devices=[[:alnum:]:;,-]*' /etc/NetworkManager/NetworkManager.conf | sed 's/unmanaged-devices=//' | tr ';,' ' ')
+
+    if [[ -z "$UNMANAGED" ]]; then
+        mutex_unlock
+        return 1
+    fi
+
+    [[ -n "$MAC" ]] && UNMANAGED=$(echo $UNMANAGED | sed -e "s/mac:${MAC}\( \|$\)//g")
+    UNMANAGED=$(echo $UNMANAGED | sed -e "s/interface-name:${1}\( \|$\)//g")
+    UNMANAGED=$(echo $UNMANAGED | sed -e 's/ $//')
+
+    if [[ -z "$UNMANAGED" ]]; then
+        sed -e "/^unmanaged-devices=.*/d" -i ${NETWORKMANAGER_CONF}
+    else
+        UNMANAGED="${UNMANAGED// /;}"
+        UNMANAGED="unmanaged-devices=${UNMANAGED}"
+        sed -e "s/^unmanaged-devices=.*/${UNMANAGED}/" -i ${NETWORKMANAGER_CONF}
+    fi
+
+    ADDED_UNMANAGED="${ADDED_UNMANAGED/ ${1} /}"
+    mutex_unlock
+
+    local nm_pid=$(pidof NetworkManager)
+    [[ -n "$nm_pid" ]] && kill -HUP $nm_pid
+
+    return 0
+}
+
+networkmanager_fix_unmanaged() {
+    [[ -f ${NETWORKMANAGER_CONF} ]] || return
+
+    mutex_lock
+    sed -e "/^unmanaged-devices=.*/d" -i ${NETWORKMANAGER_CONF}
+    mutex_unlock
+
+    local nm_pid=$(pidof NetworkManager)
+    [[ -n "$nm_pid" ]] && kill -HUP $nm_pid
+}
+
+networkmanager_rm_unmanaged_if_needed() {
+    [[ $ADDED_UNMANAGED =~ .*\ ${1}\ .* ]] && networkmanager_rm_unmanaged $1 $2
+}
+
+networkmanager_wait_until_unmanaged() {
+    local RES
+    networkmanager_is_running || return 1
+    while :; do
+        networkmanager_iface_is_unmanaged "$1"
+        RES=$?
+        [[ $RES -eq 0 ]] && break
+        [[ $RES -eq 2 ]] && die "Interface '${1}' does not exist.
+       It's probably renamed by a udev rule."
+        sleep 1
+    done
+    sleep 2
+    return 0
+}
+
+
+WPA_VERSION=1+2
+WPA_PROTO="RSN WPA"
+GROUP=CCMP
+PAIRWISE=CCMP
+NO_DNSMASQ=0
+HIDDEN=0
+DRIVER=nl80211
+NEW_MACADDR=
+DAEMONIZE=0
+DAEMON_PIDFILE=
+DAEMON_LOGFILE=/dev/null
+
+USE_PSK=0
+USE_WEP=0
+USE_DHCP=0
+USE_CONF=0
+SUPP_CONF=
+
+CONFIG_OPTS=(WPA_VERSION GROUP PAIRWISE USE_DHCP HIDDEN NEW_MACADDR DAEMONIZE DAEMON_PIDFILE
+             DAEMON_LOGFILE WIFI_IFACE SSID PASSPHRASE USE_PSK DRIVER)
+
+LIST_RUNNING=0
+STOP_ID=
+LIST_CLIENTS_ID=
+
+CONFDIR=
+ETC_RESOLV=/etc/resolv.conf
+WIFI_IFACE=
+
+OLD_MACADDR=
+
+KEY_MGMT=WPA-PSK
+
+
+_cleanup() {
+    local PID x
+
+    trap "" SIGINT SIGUSR1 SIGUSR2 EXIT
+    mutex_lock
+    disown -a
+
+    # kill haveged_watchdog
+    [[ -n "$HAVEGED_WATCHDOG_PID" ]] && kill $HAVEGED_WATCHDOG_PID
+
+    # kill processes
+    for x in $CONFDIR/*.pid; do
+        # even if the $CONFDIR is empty, the for loop will assign
+        # a value in $x. so we need to check if the value is a file
+        [[ -f $x ]] && kill -9 $(cat $x)
+    done
+    
+    pkill wpa_supplicant
+
+    
+    if [[ $USE_DHCP -eq 1 ]]; then
+        mv $CONFDIR/resolv_old.conf $ETC_RESOLV
+    fi
+
+    
+    rm -rf $CONFDIR
+
+    # if we are the last create_sta instance then set back the common values
+    if ! has_running_instance; then
+        # kill common processes
+        for x in $COMMON_CONFDIR/*.pid; do
+            [[ -f $x ]] && kill -9 $(cat $x)
+        done
+
+        rm -rf $COMMON_CONFDIR
+    fi
+
+
+    ip link set down dev ${WIFI_IFACE}
+    ip addr flush ${WIFI_IFACE}
+    if [[ -n "$NEW_MACADDR" ]]; then
+        ip link set dev ${WIFI_IFACE} address ${OLD_MACADDR}
+    fi
+
+    networkmanager_rm_unmanaged_if_needed ${WIFI_IFACE} ${OLD_MACADDR}
+
+    mutex_unlock
+    cleanup_lock
+
+    if [[ $RUNNING_AS_DAEMON -eq 1 && -n "$DAEMON_PIDFILE" && -f "$DAEMON_PIDFILE" ]]; then
+        rm $DAEMON_PIDFILE
+    fi
+    
+    ip link set up dev ${WIFI_IFACE}    
+    rm /tmp/create_sta.all.lock
+
+}
+
+cleanup() {
+    echo
+    echo -n "Doing cleanup.. "    
+    _cleanup > /dev/null 2>&1
+    echo "done"
+}
+
+die() {
+    [[ -n "$1" ]] && echo -e "\nERROR: $1\n" >&2
+    # send die signal to the main process
+    [[ $BASHPID -ne $$ ]] && kill -USR2 $$
+    # we don't need to call cleanup because it's traped on EXIT
+    exit 1
+}
+
+clean_exit() {
+    # send clean_exit signal to the main process
+    [[ $BASHPID -ne $$ ]] && kill -USR1 $$
+    # we don't need to call cleanup because it's traped on EXIT
+    exit 0
+}
+
+list_running_conf() {
+    local x
+    mutex_lock
+    for x in /tmp/create_sta.*; do
+        if [[ -f $x/pid && -f $x/wifi_iface && -d /proc/$(cat $x/pid) ]]; then
+            echo $x
+        fi
+    done
+    mutex_unlock
+}
+
+list_running() {
+    local IFACE wifi_iface x
+    mutex_lock
+    for x in $(list_running_conf); do
+        IFACE=${x#*.}
+        IFACE=${IFACE%%.*}
+        wifi_iface=$(cat $x/wifi_iface)
+
+        if [[ $IFACE == $wifi_iface ]]; then
+            echo $(cat $x/pid) $IFACE
+        else
+            echo $(cat $x/pid) $IFACE '('$(cat $x/wifi_iface)')'
+        fi
+    done
+    mutex_unlock
+}
+
+get_wifi_iface_from_pid() {
+    list_running | awk '{print $1 " " $NF}' | tr -d '\(\)' | grep -E "^${1} " | cut -d' ' -f2
+}
+
+get_pid_from_wifi_iface() {
+    list_running | awk '{print $1 " " $NF}' | tr -d '\(\)' | grep -E " ${1}$" | cut -d' ' -f1
+}
+
+get_confdir_from_pid() {
+    local IFACE x
+    mutex_lock
+    for x in $(list_running_conf); do
+        if [[ $(cat $x/pid) == "$1" ]]; then
+            echo $x
+            break
+        fi
+    done
+    mutex_unlock
+}
+
+
+has_running_instance() {
+    local PID x
+
+    mutex_lock
+    for x in /tmp/create_sta.*; do
+        if [[ -f $x/pid ]]; then
+            PID=$(cat $x/pid)
+            if [[ -d /proc/$PID ]]; then
+                mutex_unlock
+                return 0
+            fi
+        fi
+    done
+    mutex_lock
+
+    return 1
+}
+
+is_running_pid() {
+    list_running | grep -E "^${1} " > /dev/null 2>&1
+}
+
+send_stop() {
+    local x
+
+    mutex_lock
+    # send stop signal to specific pid
+    if is_running_pid $1; then
+        kill -USR1 $1
+        mutex_unlock
+        return
+    fi
+
+    # send stop signal to specific interface
+    for x in $(list_running | grep -E " \(?${1}( |\)?\$)" | cut -f1 -d' '); do
+        kill -USR1 $x
+    done
+    mutex_unlock
+}
+
+
+
+ARGS=( "$@" )
+
+# Preprocessing for --config before option-parsing starts
+for ((i=0; i<$#; i++)); do
+    if [[ "${ARGS[i]}" = "--config" ]]; then
+        if [[ -f "${ARGS[i+1]}" ]]; then
+            LOAD_CONFIG="${ARGS[i+1]}"
+            read_config
+        else
+            echo "ERROR: No config file found at given location" >&2
+            exit 1
+        fi
+        break
+    fi
+done
+
+GETOPT_ARGS=$(getopt -o hvd:w:p:g:c: -l "help","hidden","version","driver:","wpa:","pair:","group:","psk","wep","mac:","dhcp","daemon","pidfile:","logfile:","stop:","list-running","list-clients:","config:" -n "$PROGNAME" -- "$@")
+[[ $? -ne 0 ]] && exit 1
+eval set -- "$GETOPT_ARGS"
+
+while :; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            echo $VERSION
+            exit 0
+            ;;
+        --hidden)
+            shift
+            HIDDEN=1
+            ;;
+        -w|--wpa)
+            shift
+            WPA_VERSION="$1"
+            shift
+            ;;
+        -d|--driver)
+            shift
+            DRIVER="$1"
+            shift
+            ;;
+        -p|--pair)
+            shift
+            PAIRWISE="$1"
+            [[ "$PAIRWISE" == "CCMP+TKIP" ]] && PAIRWISE="CCMP TKIP"
+            [[ "$PAIRWISE" == "TKIP+CCMP" ]] && PAIRWISE="TKIP CCMP"
+            shift
+            ;;
+        -g|--group)
+            shift
+            GROUP="$1"
+            [[ "$GROUP" == "CCMP+TKIP" ]] && GROUP="CCMP TKIP"
+            [[ "$GROUP" == "TKIP+CCMP" ]] && GROUP="TKIP CCMP"
+            shift
+            ;;
+        --wep)
+            shift
+            KEY_MGMT=NONE
+            USE_WEP=1
+            ;;
+        --mac)
+            shift
+            NEW_MACADDR="$1"
+            shift
+            ;;
+        --dhcp)
+            shift
+            USE_DHCP=1
+            ;;
+        --psk)
+            shift
+            USE_PSK=1
+            ;;
+        --daemon)
+            shift
+            DAEMONIZE=1
+            ;;
+        --pidfile)
+            shift
+            DAEMON_PIDFILE="$1"
+            shift
+            ;;
+        --logfile)
+            shift
+            DAEMON_LOGFILE="$1"
+            shift
+            ;;
+        --stop)
+            shift
+            STOP_ID="$1"
+            shift
+            ;;
+        --list-running)
+            shift
+            LIST_RUNNING=1
+            ;;
+        --list-clients)
+            shift
+            LIST_CLIENTS_ID="$1"
+            shift
+            ;;
+        -c|--config)
+            shift
+	    USE_CONF=1
+	    SUPP_CONF="$1"
+	    shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+    esac
+done
+
+# Set DAEMONIZE, if USE_DHCP is true
+if [[ $USE_DHCP -eq 1 ]]; then
+  DAEMONIZE=1
+fi
+
+trap "cleanup_lock" EXIT
+
+if ! init_lock; then
+    echo "ERROR: Failed to initialize lock" >&2
+    exit 1
+fi
+
+# if the user press ctrl+c or we get USR1 signal
+# then run clean_exit()
+trap "clean_exit" SIGINT SIGUSR1
+# if we get USR2 signal then run die().
+trap "die" SIGUSR2
+
+if [[ $LIST_RUNNING -eq 1 ]]; then
+    echo -e "List of running $PROGNAME instances:\n"
+    list_running
+    exit 0
+fi
+
+if [[ -n "$LIST_CLIENTS_ID" ]]; then
+    list_clients "$LIST_CLIENTS_ID"
+    exit 0
+fi
+
+if [[ $(id -u) -ne 0 ]]; then
+    echo "You must run it as root." >&2
+    exit 1
+fi
+
+if [[ -n "$STOP_ID" ]]; then
+    echo "Trying to kill $PROGNAME instance associated with $STOP_ID..."
+    send_stop "$STOP_ID"
+    exit 0
+fi
+
+if [[ $FIX_UNMANAGED -eq 1 ]]; then
+    echo "Trying to fix unmanaged status in NetworkManager..."
+    networkmanager_fix_unmanaged
+    exit 0
+fi
+
+
+# Aki) Need to Checked
+#if [[ $DAEMONIZE -eq 1 && $RUNNING_AS_DAEMON -eq 0 ]]; then
+#    # Assume we're running underneath a service manager if PIDFILE is set
+#    # and don't clobber it's output with a useless message
+#    if [ -z "$DAEMON_PIDFILE" ]; then
+#        echo "Running as Daemon..."
+#    fi
+#    # run a detached create_sta
+#    RUNNING_AS_DAEMON=1 setsid "$0" "${ARGS[@]}" >>$DAEMON_LOGFILE 2>&1 &
+#    exit 0
+#elif [[ $RUNNING_AS_DAEMON -eq 1 && -n "$DAEMON_PIDFILE" ]]; then
+#    echo $$ >$DAEMON_PIDFILE
+#fi
+
+
+
+WIFI_IFACE="$1"
+SSID="$2"
+PASSPHRASE="$3"
+
+
+if ! is_wifi_interface ${WIFI_IFACE}; then
+    echo "ERROR: '${WIFI_IFACE}' is not a WiFi interface" >&2
+    exit 1
+fi
+
+if ! can_be_ap ${WIFI_IFACE}; then
+    echo "ERROR: Your adapter does not support AP (master) mode" >&2
+    exit 1
+fi
+
+if ! can_be_sta_and_ap ${WIFI_IFACE}; then
+    if is_wifi_connected ${WIFI_IFACE}; then
+        echo "ERROR: Your adapter can not be a station (i.e. be connected) and an AP at the same time" >&2
+        exit 1
+    elif [[ $NO_VIRT -eq 0 ]]; then
+        echo "WARN: Your adapter does not fully support AP virtual interface, enabling --no-virt" >&2
+        NO_VIRT=1
+    fi
+fi
+
+
+WPA_SUPPLICANT=$(which wpa_supplicant)
+DHCLIENT=$(which dhclient)
+
+if [[ ! -x "$WPA_SUPPLICANT" ]]; then
+    echo "ERROR: wpa_supplicant not found." >&2
+    exit 1
+fi
+
+if [[ ! -x "$DHCLIENT" ]]; then
+    echo "ERROR: dhclient not found." >&2
+    exit 1
+fi
+
+
+if [[ -n "$NEW_MACADDR" ]]; then
+    if ! is_macaddr "$NEW_MACADDR"; then
+        echo "ERROR: '${NEW_MACADDR}' is not a valid MAC address" >&2
+        exit 1
+    fi
+
+    if ! is_unicast_macaddr "$NEW_MACADDR"; then
+        echo "ERROR: The first byte of MAC address (${NEW_MACADDR}) must be even" >&2
+        exit 1
+    fi
+
+    if [[ $(get_all_macaddrs | grep -c ${NEW_MACADDR}) -ne 0 ]]; then
+        echo "WARN: MAC address '${NEW_MACADDR}' already exists. Because of this, you may encounter some problems" >&2
+    fi
+fi
+
+if [[ ${#SSID} -lt 1 || ${#SSID} -gt 32 ]]; then
+    echo "ERROR: Invalid SSID length ${#SSID} (expected 1..32)" >&2
+    exit 1
+fi
+
+if [[ $USE_PSK -eq 0 ]]; then
+    if [[ ${#PASSPHRASE} -gt 0 && ${#PASSPHRASE} -lt 8 ]] || [[ ${#PASSPHRASE} -gt 63 ]]; then
+        echo "ERROR: Invalid passphrase length ${#PASSPHRASE} (expected 8..63)" >&2
+        exit 1
+    fi
+elif [[ ${#PASSPHRASE} -gt 0 && ${#PASSPHRASE} -ne 64 ]]; then
+    echo "ERROR: Invalid pre-shared-key length ${#PASSPHRASE} (expected 64)" >&2
+    exit 1
+fi
+
+if [[ $(get_adapter_kernel_module ${WIFI_IFACE}) =~ ^rtl[0-9].*$ ]]; then
+    if [[ -n "$PASSPHRASE" ]]; then
+        echo "WARN: Realtek drivers usually have problems with WPA1, enabling -w 2" >&2
+        WPA_VERSION=2
+    fi
+    echo "WARN: If AP doesn't work, please read: howto/realtek.md" >&2
+fi
+
+mutex_lock
+trap "cleanup" EXIT
+CONFDIR=$(mktemp -d /tmp/create_sta.${WIFI_IFACE}.conf.XXXXXXXX)
+echo "Config dir: $CONFDIR"
+echo "PID: $$"
+echo $$ > $CONFDIR/pid
+
+# to make --list-running work from any user, we must give read
+# permissions to $CONFDIR and $CONFDIR/pid
+chmod 755 $CONFDIR
+chmod 444 $CONFDIR/pid
+
+COMMON_CONFDIR=/tmp/create_sta.common.conf
+mkdir -p $COMMON_CONFDIR
+
+if [[ $USE_DHCP -eq 1 ]]; then
+    cp $ETC_RESOLV $CONFDIR/resolv_old.conf
+fi
+    
+mutex_unlock
+
+
+OLD_MACADDR=$(get_macaddr ${WIFI_IFACE})
+
+
+mutex_lock
+echo $WIFI_IFACE > $CONFDIR/wifi_iface
+chmod 444 $CONFDIR/wifi_iface
+mutex_unlock
+
+
+if networkmanager_exists && ! networkmanager_iface_is_unmanaged ${WIFI_IFACE}; then
+    echo -n "Network Manager found, set ${WIFI_IFACE} as unmanaged device... "
+    networkmanager_add_unmanaged ${WIFI_IFACE}
+    
+    if networkmanager_is_running; then
+        networkmanager_wait_until_unmanaged ${WIFI_IFACE}
+    fi
+    
+    echo "DONE"
+fi
+
+
+[[ $HIDDEN -eq 1 ]] && echo "Connect to the Access Point hidden SSID!"
+
+[[ "$WPA_VERSION" == "1+2" ]] && WPA_VERSION=3
+
+while :; do
+    case "$WPA_VERSION" in
+        "1")
+            WPA_PROTO="WPA"
+            break
+            ;;
+        "2")
+            WPA_PROTO="RSN"
+            break
+            ;;
+        "3")
+            WPA_PROTO="RSN WPA"
+            break
+            ;;
+    esac
+done
+
+# wpa_supplicant config
+if [[ -n "$PASSPHRASE" ]]; then
+    if [[ $USE_WEP -eq 0 ]]; then
+        cat << EOF >> $CONFDIR/wpa_supplicant.conf
+network={
+    key_mgmt=WPA-PSK
+    proto=${WPA_PROTO}
+    pairwise=${PAIRWISE}
+    group=${GROUP}
+    ssid="${SSID}"
+    psk="${PASSPHRASE}"
+}
+EOF
+    else
+        cat << EOF >> $CONFDIR/wpa_supplicant.conf
+network={
+    key_mgmt=NONE
+    ssid="${SSID}"
+    wep_key0=${PASSPHRASE}
+}
+EOF
+    fi
+else
+    cat << EOF >> $CONFDIR/wpa_supplicant.conf
+network={
+    key_mgmt=NONE
+    ssid="${SSID}"
+}
+EOF
+fi
+
+
+# initialize WiFi interface
+pkill wpa_supplicant
+ip link set down dev ${WIFI_IFACE} || die
+ip addr flush ${WIFI_IFACE} || die
+if [[ -n "$NEW_MACADDR" ]]; then
+    ip link set dev ${WIFI_IFACE} address ${NEW_MACADDR} || die
+fi
+
+
+
+# start station
+
+if [[ $NO_HAVEGED -eq 0 ]]; then
+    haveged_watchdog &
+    HAVEGED_WATCHDOG_PID=$!
+fi
+
+
+
+# start wpa_supplicant
+if [[ $DAEMONIZE -eq 1 ]]; then
+    if [[ $USE_CONF -eq 0 ]]; then
+	$WPA_SUPPLICANT -D $DRIVER -i $WIFI_IFACE -c $CONFDIR/wpa_supplicant.conf -P $PID_FILE -f $LOG_FILE -B
+    else
+	$WPA_SUPPLICANT -D $DRIVER -i $WIFI_IFACE -c $SUPP_CONF -P $PID_FILE -f $LOG_FILE -B
+    fi
+
+    if [[ $USE_DHCP -eq 1 ]]; then
+	$DHCLIENT -v $WIFI_IFACE
+    fi
+
+    while :; do
+        echo -ne "\r" 2>/dev/null
+    done
+
+else
+    if [[ $USE_CONF -eq 0 ]]; then
+	$WPA_SUPPLICANT -D $DRIVER -i $WIFI_IFACE -c $CONFDIR/wpa_supplicant.conf -P $PID_FILE -f $LOG_FILE
+    else
+	$WPA_SUPPLICANT -D $DRIVER -i $WIFI_IFACE -c $SUPP_CONF -P $PID_FILE -f $LOG_FILE
+    fi
+fi
+
+
+
+# I am not a vimmer but a emacser. 
