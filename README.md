@@ -53,7 +53,7 @@
 ### WPA2-CCMP/TKIP:
     create_sta -w 2 --pair CCMP --group TKIP wlan0 MyAccessPoint MyPassPhrase
 
-### Use SUPPLICANT_CONF:
+### Use wpa_supplicant.conf:
     create_sta -c /path/to/wpa_supplicant.conf wlan0 MyAccessPoint
 
 ### Use DHCP Client:
