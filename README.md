@@ -49,7 +49,7 @@
     create_sta -w 2 --pair TKIP --group TKIP wlan0 MyAccessPoint MyPassPhrase
 
 ### WEP key:
-    create_ap --wep wlan0 MyAccessPoint MyPassPhrase
+    create_sta --wep wlan0 MyAccessPoint MyPassPhrase
 
 
 ## License
