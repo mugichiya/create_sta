@@ -28,6 +28,9 @@
 ### No passphrase (open network):
     create_sta wlan0 MyAccessPoint
 
+### WEP key:
+    create_sta --wep wlan0 MyAccessPoint MyPassPhrase
+
 ### WPA + WPA2 passphrase:
     create_sta -w 1+2 --pair CCMP+TKIP --group CCMP+TKIP wlan0 MyAccessPoint MyPassPhrase
 
@@ -37,7 +40,6 @@
 
 ### WPA-CCMP:
     create_sta -w 1 --pair CCMP --group CCMP wlan0 MyAccessPoint MyPassPhrase
-    (Note: Realtek drivers usually have problems with WPA1, forcing WPA2)
 
 ### WPA-CCMP/TKIP:
     create_sta -w 1 --pair CCMP --group TKIP wlan0 MyAccessPoint MyPassPhrase
@@ -51,8 +53,12 @@
 ### WPA2-CCMP/TKIP:
     create_sta -w 2 --pair CCMP --group TKIP wlan0 MyAccessPoint MyPassPhrase
 
-### WEP key:
-    create_sta --wep wlan0 MyAccessPoint MyPassPhrase
+### USE SUPPLICANT_CONF:
+    create_sta -c /path/to/wpa_supplicant.conf wlan0 MyAccessPoint
+
+### USE DHCP:
+    create_sta -w 1+2 --pair CCMP+TKIP --group CCMP+TKIP --dhcp wlan0 MyAccessPoint MyPassPhrase
+
 
 
 ## License
