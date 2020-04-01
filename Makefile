@@ -7,9 +7,9 @@ all:
 	@echo "Run 'make uninstall' for uninstallation."
 
 install:
-	install -Dm755 create_ap $(DESTDIR)$(BINDIR)/create_ap
-	install -Dm644 README.md $(DESTDIR)$(PREFIX)/share/doc/create_ap/README.md
+	install -Dm755 create_sta $(DESTDIR)$(BINDIR)/create_sta
+	install -Dm644 README.md $(DESTDIR)$(PREFIX)/share/doc/create_sta/README.md
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/create_ap
-	rm -f $(DESTDIR)$(PREFIX)/share/doc/create_ap/README.md
+	rm -f $(DESTDIR)$(BINDIR)/create_sta
+	rm -f $(DESTDIR)$(PREFIX)/share/doc/create_sta/README.md
