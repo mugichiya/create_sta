@@ -56,11 +56,11 @@
 ### Use wpa_supplicant.conf:
     create_sta -c /path/to/wpa_supplicant.conf wlan0 MyAccessPoint
 
-### Stealth SSID:
-    create_sta --hidden -w 1+2 --pair CCMP+TKIP --group CCMP+TKIP wlan0 MyAccessPoint MyPassPhrase
-
 ### Use DHCP Client:
     create_sta --dhcp -w 1+2 --pair CCMP+TKIP --group CCMP+TKIP wlan0 MyAccessPoint MyPassPhrase
+
+### SSID Stealth:
+    create_sta --hidden -w 1+2 --pair CCMP+TKIP --group CCMP+TKIP wlan0 MyAccessPoint MyPassPhrase
 
 ### Use WPA Pre-Shared-Key (instead of WPA Passphrase):
     create_sta --psk -w 1+2 --pair CCMP+TKIP --group CCMP+TKIP wlan0 MyAccessPoint MyPreSharedKey
