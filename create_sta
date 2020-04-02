@@ -11,7 +11,7 @@
 #    haveged (optional)
 
 
-VERSION=0.0.2
+VERSION=0.0.3
 PROGNAME="$(basename $0)"
 
 # make sure that all command outputs are in english
@@ -1041,8 +1041,10 @@ done
 # wpa_supplicant config
 if [[ -n "$PASSPHRASE" ]]; then
     if [[ $USE_WEP -eq 0 ]]; then
-        cat << EOF >> $CONFDIR/wpa_supplicant.conf
+	if [[ $USE_PSK -eq 0 ]]; then
+            cat << EOF >> $CONFDIR/wpa_supplicant.conf
 network={
+    scan_ssid=${HIDDEN}
     key_mgmt=WPA-PSK
     proto=${WPA_PROTO}
     pairwise=${PAIRWISE}
@@ -1051,9 +1053,23 @@ network={
     psk="${PASSPHRASE}"
 }
 EOF
+	else
+            cat << EOF >> $CONFDIR/wpa_supplicant.conf
+network={
+    scan_ssid=${HIDDEN}
+    key_mgmt=WPA-PSK
+    proto=${WPA_PROTO}
+    pairwise=${PAIRWISE}
+    group=${GROUP}
+    ssid="${SSID}"
+    psk=${PASSPHRASE}
+}
+EOF
+	fi
     else
         cat << EOF >> $CONFDIR/wpa_supplicant.conf
 network={
+    scan_ssid=${HIDDEN}
     key_mgmt=NONE
     ssid="${SSID}"
     wep_key0=${PASSPHRASE}
@@ -1063,6 +1079,7 @@ EOF
 else
     cat << EOF >> $CONFDIR/wpa_supplicant.conf
 network={
+    scan_ssid=${HIDDEN}
     key_mgmt=NONE
     ssid="${SSID}"
 }
