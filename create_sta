@@ -4,15 +4,12 @@
 #    bash (to run this script)
 #    util-linux (for getopt)
 #    procps or procps-ng
-#    hostapd
-#    iproute2
+#    wpa_supplicant
+#    dhclient
 #    iw
 #    iwconfig (you only need this if 'iw' can not recognize your adapter)
 #    haveged (optional)
 
-# dependencies for 'nat' or 'none' Internet sharing method
-#    dnsmasq
-#    iptables
 
 VERSION=0.0.2
 PROGNAME="$(basename $0)"
