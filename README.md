@@ -41,7 +41,7 @@
 
 ### WPA-TKIP:
     create_sta -w 1 --pair TKIP --group TKIP wlan0 MyAccessPoint MyPassPhrase
-    (Note: Realtek drivers usually have problems with WPA1, forcing WPA2)
+    (Note: Realtek drivers usually have problems with WPA1, forcing WPA2.)
 
 ### WPA-CCMP:
     create_sta -w 1 --pair CCMP --group CCMP wlan0 MyAccessPoint MyPassPhrase
