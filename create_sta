@@ -1127,6 +1127,7 @@ network={
     key_mgmt=OWE
     proto=RSN
     pairwise=CCMP
+}
 EOF
 else
     cat << EOF >> $CONFDIR/wpa_supplicant.conf
