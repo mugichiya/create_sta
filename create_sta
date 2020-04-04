@@ -1072,7 +1072,7 @@ if [[ -n "$PASSPHRASE" ]]; then
                 echo "ERROR: Your adaptor does not support SAE." >&2
                 exit 1
             fi
-            cat << EOF >> $CONFDIR/hostapd.conf
+            cat << EOF >> $CONFDIR/wpa_supplicant.conf
 network={
     scan_ssid=${HIDDEN}
     key_mgmt=SAE
@@ -1120,7 +1120,7 @@ network={
 EOF
     fi
 elif [[ $USE_OWE -eq 1 ]]; then
-    cat << EOF >> $CONFDIR/hostapd.conf                                                                                       
+    cat << EOF >> $CONFDIR/wpa_supplicant.conf
 network={
     scan_ssid=${HIDDEN}
     ssid="${SSID}"
