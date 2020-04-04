@@ -11,7 +11,7 @@
 #    haveged (optional)
 
 
-VERSION=0.0.3
+VERSION=0.0.5
 PROGNAME="$(basename $0)"
 
 # make sure that all command outputs are in english
@@ -33,8 +33,11 @@ usage() {
     echo "  -w, --wpa <WPA version> Use 1 for WPA, use 2 for WPA2, use 1+2 for both (default: 1+2)"
     echo "  -p, --pair  <ENC>       Use CCMP, TKIP, or CCMP+TKIP (default: CCMP) "
     echo "  -g, --group <ENC>       Use CCMP, TKIP, or CCMP+TKIP (default: CCMP) "
+    echo "  -x </path/to/supp_dir/> Choose directory include your own wpa_supplicant"
     echo "  --psk                   Use 64 hex digits pre-shared-key instead of passphrase"    
+    echo "  --enhanced_open         Use Opportunistic Wireless Encryption (OWE)"
     echo "  --wep                   Use 10 or 26 hex digits WEP key instead of WPA series"
+    echo "  --sae                   Use SAE(Dragonfly Handshake)"
     echo "  --mac <MAC>             Set MAC address"
     echo "  --hidden                Try to connect the hidden Access Point"
     echo "  --dhcp                  Use DHCP to obtain an IP address "
@@ -524,9 +527,13 @@ DAEMON_LOGFILE=/dev/null
 
 USE_PSK=0
 USE_WEP=0
+USE_SAE=0
+USE_OWE=0
+
 USE_DHCP=0
 USE_CONF=0
 SUPP_CONF=
+USE_DEFAULT_SUPP=1
 
 CONFIG_OPTS=(WPA_VERSION GROUP PAIRWISE USE_DHCP HIDDEN NEW_MACADDR DAEMONIZE DAEMON_PIDFILE
              DAEMON_LOGFILE WIFI_IFACE SSID PASSPHRASE USE_PSK DRIVER)
@@ -731,7 +738,7 @@ for ((i=0; i<$#; i++)); do
     fi
 done
 
-GETOPT_ARGS=$(getopt -o hvd:w:p:g:c: -l "help","hidden","version","driver:","wpa:","pair:","group:","psk","wep","mac:","dhcp","daemon","pidfile:","logfile:","stop:","list-running","list-clients:","config:" -n "$PROGNAME" -- "$@")
+GETOPT_ARGS=$(getopt -o hvd:w:p:g:c:x: -l "help","hidden","version","driver:","wpa:","pair:","group:","psk","wep","enhanced_open","sae","mac:","dhcp","daemon","pidfile:","logfile:","stop:","list-running","list-clients:","config:" -n "$PROGNAME" -- "$@")
 [[ $? -ne 0 ]] && exit 1
 eval set -- "$GETOPT_ARGS"
 
@@ -772,6 +779,20 @@ while :; do
             [[ "$GROUP" == "CCMP+TKIP" ]] && GROUP="CCMP TKIP"
             [[ "$GROUP" == "TKIP+CCMP" ]] && GROUP="TKIP CCMP"
             shift
+            ;;
+        -x)
+            shift
+            USE_DEFAULT_SUPP=0
+            WPA_SUPPLICANT="$1/wpa_supplicant"
+            shift
+            ;;
+        --sae)
+            shift
+            USE_SAE=1
+            ;;
+	--enhanced_open)
+            shift
+            USE_OWE=1
             ;;
         --wep)
             shift
@@ -921,13 +942,16 @@ if ! can_be_sta_and_ap ${WIFI_IFACE}; then
 fi
 
 
-WPA_SUPPLICANT=$(which wpa_supplicant)
-DHCLIENT=$(which dhclient)
 
-if [[ ! -x "$WPA_SUPPLICANT" ]]; then
-    echo "ERROR: wpa_supplicant not found." >&2
-    exit 1
+if [[ $USE_DEFAULT_SUPP -eq 1 ]]; then
+    WPA_SUPPLICANT=$(which wpa_supplicant)
+    if [[ ! -x "$WPA_SUPPLICANT" ]]; then
+	echo "ERROR: wpa_supplicant not found." >&2
+	exit 1
+    fi
 fi
+
+DHCLIENT=$(which dhclient)
 
 if [[ ! -x "$DHCLIENT" ]]; then
     echo "ERROR: dhclient not found." >&2
@@ -1041,7 +1065,26 @@ done
 # wpa_supplicant config
 if [[ -n "$PASSPHRASE" ]]; then
     if [[ $USE_WEP -eq 0 ]]; then
-	if [[ $USE_PSK -eq 0 ]]; then
+	# SAE config
+	if [[ $USE_SAE -eq 1 ]]; then
+	    IS_SUPPORTED=$(get_adapter_info "$1" | grep -E 'grep 00-0f-ac:8' > /dev/null 2>&1)
+	    if [[ ! -x "$IS_SUPPORTED" ]]; then
+                echo "ERROR: Your adaptor does not support SAE." >&2
+                exit 1
+            fi
+            cat << EOF >> $CONFDIR/hostapd.conf
+network={
+    scan_ssid=${HIDDEN}
+    key_mgmt=SAE
+    proto=RSN
+    pairwise=CCMP
+    group=CCMP
+    ssid="${SSID}"
+    psk="${PASSPHRASE}"
+}
+EOF
+	# PSK config
+	elif [[ $USE_PSK -eq 0 ]]; then
             cat << EOF >> $CONFDIR/wpa_supplicant.conf
 network={
     scan_ssid=${HIDDEN}
@@ -1076,6 +1119,15 @@ network={
 }
 EOF
     fi
+elif [[ $USE_OWE -eq 1 ]]; then
+    cat << EOF >> $CONFDIR/hostapd.conf                                                                                       
+network={
+    scan_ssid=${HIDDEN}
+    ssid="${SSID}"
+    key_mgmt=OWE
+    proto=RSN
+    pairwise=CCMP
+EOF
 else
     cat << EOF >> $CONFDIR/wpa_supplicant.conf
 network={
