@@ -1066,9 +1066,16 @@ done
 if [[ -n "$PASSPHRASE" ]]; then
     if [[ $USE_WEP -eq 0 ]]; then
 	# SAE config
+<<<<<<< HEAD
         elif [[ $USE_SAE -eq 1 ]]; then
             if [[ ! $(get_adapter_info $WIFI_IFACE) =~ "00-0f-ac:8" ]]; then
 	        echo "ERROR: Your adaptor does not support SAE." >&2
+=======
+	if [[ $USE_SAE -eq 1 ]]; then
+	    IS_SUPPORTED=$(get_adapter_info "$1" | grep -E '00-0f-ac:8' > /dev/null 2>&1)
+	    if [[ -n "$IS_SUPPORTED" ]]; then
+                echo "ERROR: Your adaptor does not support SAE." >&2
+>>>>>>> 0f3a0b1c3fd740dd797ca3a356b77318b3de3298
                 exit 1
             fi
             cat << EOF >> $CONFDIR/wpa_supplicant.conf
