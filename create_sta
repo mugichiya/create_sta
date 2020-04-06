@@ -11,7 +11,7 @@
 #    haveged (optional)
 
 
-VERSION=0.0.5
+VERSION=0.0.7
 PROGNAME="$(basename $0)"
 
 # make sure that all command outputs are in english
@@ -1066,10 +1066,9 @@ done
 if [[ -n "$PASSPHRASE" ]]; then
     if [[ $USE_WEP -eq 0 ]]; then
 	# SAE config
-	if [[ $USE_SAE -eq 1 ]]; then
-	    IS_SUPPORTED=$(get_adapter_info "$1" | grep -E 'grep 00-0f-ac:8' > /dev/null 2>&1)
-	    if [[ ! -x "$IS_SUPPORTED" ]]; then
-                echo "ERROR: Your adaptor does not support SAE." >&2
+        elif [[ $USE_SAE -eq 1 ]]; then
+            if [[ ! $(get_adapter_info $WIFI_IFACE) =~ "00-0f-ac:8" ]]; then
+	        echo "ERROR: Your adaptor does not support SAE." >&2
                 exit 1
             fi
             cat << EOF >> $CONFDIR/wpa_supplicant.conf
